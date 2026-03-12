@@ -10,8 +10,10 @@ import plotly.express as px
 import plotly.graph_objects as go
 from parsers.excel_parser import parse_folha_de_ponto
 from parsers.pdf_parser import parse_folha_de_pagamento
+from parsers.medicao_parser import parse_medicao
 from engine.comparison import compare_payrolls
 from engine.holidays import classify_shift_date
+from engine.payroll_builder import build_payroll, get_summary_by_employee, DEFAULT_PARAMS
 from engine.database import (
     save_comparison, get_comparison_history, get_employee_trend,
     save_name_correction, get_name_corrections, delete_name_correction,
@@ -24,13 +26,303 @@ from reports.report_generator import (
     generate_excel_report,
     generate_pdf_report,
 )
+from reports.payroll_export import export_payroll_excel
 from utils.formatting import format_br_currency, hours_to_hhmm
 
+
+def _render_preparo_contabilidade():
+    """Modulo de Preparo de Contabilidade - transforma Medicao em Folha."""
+    st.title("Preparo Contabilidade")
+    st.markdown("**SF Servicos Selecao e Agenciamento LTDA** - Fechamento de Folha de Pagamento")
+
+    # --- Sidebar: parametros ---
+    with st.sidebar:
+        st.header("Parametros da Folha")
+
+        sal_base = st.number_input(
+            "Salario Base Mensal (R$)",
+            min_value=0.0, value=1621.00, step=1.0,
+            format="%.2f",
+            help="Salario minimo vigente (2026: R$ 1.621,00)"
+        )
+        divisor = st.number_input(
+            "Divisor de Horas",
+            min_value=1, value=220, step=1,
+            help="Horas mensais para calculo do salario hora (padrao: 220h)"
+        )
+
+        sal_hora_calc = sal_base / divisor if divisor > 0 else 0
+        st.info(f"Salario Hora: **R$ {sal_hora_calc:.2f}**")
+
+        ajuda_custo = st.number_input(
+            "Ajuda de Custo (R$)",
+            min_value=0.0, value=30.0, step=1.0,
+            format="%.2f",
+        )
+        vt_desc = st.number_input(
+            "Desconto VT (%)",
+            min_value=0.0, max_value=100.0, value=0.0, step=0.5,
+            format="%.1f",
+        ) / 100.0
+
+        st.divider()
+        st.header("Upload")
+        medicao_file = st.file_uploader(
+            "Relatorio de Medicao (.xlsx)",
+            type=['xlsx'],
+            help="Arquivo extraido do sistema interno",
+            key='medicao_upload',
+        )
+
+    if not medicao_file:
+        st.info("Faca upload do **Relatorio de Medicao** na barra lateral para iniciar o preparo da folha.")
+        st.markdown("""
+### Como usar:
+1. Na barra lateral, configure os parametros (salario base, ajuda de custo, etc.)
+2. Faca upload do **Relatorio de Medicao** extraido do sistema interno
+3. Revise os calculos na tabela
+4. Ajuste valores individuais se necessario (Desc. Adiantamento, Sal. Familia)
+5. Baixe a planilha final formatada
+
+### Calculos aplicados automaticamente:
+- **Adicional Noturno**: Hora ficta CLT Art. 73 (22h-05h, fator 8/7) + 20%
+- **DSR**: 1/6 sobre (Salario + Gratificacao + Ad. Noturno)
+- **Ferias**: 1/12 sobre base + 1/3 constitucional
+- **13o Salario**: 1/12 sobre base
+- **INSS**: Aliquotas progressivas 2026 (7,5% a 14%) por funcionario
+        """)
+        return
+
+    # Processar
+    params = {
+        'salario_base_mensal': sal_base,
+        'divisor_horas': divisor,
+        'dsr_fator': 1 / 6,
+        'ferias_fator': 1 / 12,
+        'ferias_adicional': 1 / 3,
+        'decimo_fator': 1 / 12,
+        'vt_desconto': vt_desc,
+        'ajuda_custo': ajuda_custo,
+    }
+
+    try:
+        with st.spinner("Processando relatorio de medicao..."):
+            turnos = parse_medicao(medicao_file.read())
+            medicao_file.seek(0)
+
+            if not turnos:
+                st.error("Nenhum turno encontrado no relatorio de medicao.")
+                return
+
+            df = build_payroll(turnos, params)
+            if df.empty:
+                st.error("Erro ao processar turnos.")
+                return
+
+        st.session_state['payroll_df'] = df
+        st.session_state['payroll_params'] = params
+
+    except Exception as e:
+        st.error(f"Erro ao processar: {e}")
+        import traceback
+        st.code(traceback.format_exc())
+        return
+
+    df = st.session_state.get('payroll_df', df)
+
+    # Metricas
+    col1, col2, col3, col4, col5 = st.columns(5)
+    with col1:
+        st.metric("Turnos", len(df))
+    with col2:
+        st.metric("Funcionarios", df['nome'].nunique())
+    with col3:
+        st.metric("Total Horas", f"{df['horas_trab_num'].sum():.1f}h")
+    with col4:
+        st.metric("Horas Noturnas", f"{df['horas_not_num'].sum():.1f}h")
+    with col5:
+        st.metric("Total a Pagar", format_br_currency(df['total_pagar'].sum()))
+
+    st.divider()
+
+    # Abas
+    tab_det, tab_resumo, tab_download = st.tabs([
+        "Detalhamento por Turno",
+        "Resumo por Funcionario",
+        "Download",
+    ])
+
+    with tab_det:
+        st.subheader("Detalhamento Completo")
+
+        # Colunas para exibir (mais legivel)
+        display_cols = {
+            'nome': 'Nome',
+            'data': 'Data',
+            'evento': 'Local',
+            'horario_inicial': 'Entrada',
+            'horario_final': 'Saida',
+            'horas_trab_num': 'Horas',
+            'horas_not_num': 'H.Noturnas',
+            'salario': 'Salario',
+            'ad_noturno_valor': 'Ad.Not.20%',
+            'dsr': 'DSR',
+            'ferias': 'Ferias',
+            'adic_ferias': 'Ad.Ferias',
+            'decimo': '13o',
+            'inss': 'INSS',
+            'inss_13': 'INSS 13o',
+            'sal_liquido': 'Sal.Liquido',
+            'ajuda_custo': 'Aj.Custo',
+            'total_pagar': 'Total',
+        }
+
+        df_display = df[list(display_cols.keys())].copy()
+        df_display.columns = list(display_cols.values())
+
+        # Formatar datas
+        df_display['Data'] = pd.to_datetime(df_display['Data'], errors='coerce').dt.strftime('%d/%m/%Y')
+        df_display['Entrada'] = df_display['Entrada'].apply(
+            lambda x: x.strftime('%H:%M') if hasattr(x, 'strftime') else str(x) if x else ''
+        )
+        df_display['Saida'] = df_display['Saida'].apply(
+            lambda x: x.strftime('%H:%M') if hasattr(x, 'strftime') else str(x) if x else ''
+        )
+
+        # Highlight noturno
+        def highlight_noturno(row):
+            if row.get('H.Noturnas', 0) > 0:
+                return ['background-color: #e8eaf6'] * len(row)
+            return [''] * len(row)
+
+        st.dataframe(
+            df_display.style.apply(highlight_noturno, axis=1).format({
+                'Horas': '{:.2f}',
+                'H.Noturnas': '{:.2f}',
+                'Salario': 'R$ {:.2f}',
+                'Ad.Not.20%': 'R$ {:.2f}',
+                'DSR': 'R$ {:.2f}',
+                'Ferias': 'R$ {:.2f}',
+                'Ad.Ferias': 'R$ {:.2f}',
+                '13o': 'R$ {:.2f}',
+                'INSS': 'R$ {:.2f}',
+                'INSS 13o': 'R$ {:.2f}',
+                'Sal.Liquido': 'R$ {:.2f}',
+                'Aj.Custo': 'R$ {:.2f}',
+                'Total': 'R$ {:.2f}',
+            }),
+            use_container_width=True,
+            hide_index=True,
+            height=600,
+        )
+
+    with tab_resumo:
+        st.subheader("Resumo por Funcionario")
+        summary = get_summary_by_employee(df)
+
+        if not summary.empty:
+            summary_display = summary.rename(columns={
+                'nome': 'Nome',
+                'qtd_turnos': 'Turnos',
+                'horas_trab_num': 'Horas',
+                'horas_not_num': 'H.Noturnas',
+                'salario': 'Salario',
+                'ad_noturno_valor': 'Ad.Not.',
+                'dsr': 'DSR',
+                'ferias': 'Ferias',
+                'adic_ferias': 'Ad.Ferias',
+                'decimo': '13o',
+                'inss': 'INSS',
+                'inss_13': 'INSS 13o',
+                'sal_liquido': 'Sal.Liquido',
+                'ajuda_custo': 'Aj.Custo',
+                'total_pagar': 'Total',
+            })
+
+            # Selecionar colunas para exibir
+            cols_show = ['Nome', 'Turnos', 'Horas', 'H.Noturnas', 'Salario',
+                         'Ad.Not.', 'DSR', 'Ferias', 'Ad.Ferias', '13o',
+                         'INSS', 'INSS 13o', 'Sal.Liquido', 'Aj.Custo', 'Total']
+            summary_show = summary_display[[c for c in cols_show if c in summary_display.columns]]
+
+            st.dataframe(
+                summary_show.style.format({
+                    'Horas': '{:.2f}',
+                    'H.Noturnas': '{:.2f}',
+                    'Salario': 'R$ {:.2f}',
+                    'Ad.Not.': 'R$ {:.2f}',
+                    'DSR': 'R$ {:.2f}',
+                    'Ferias': 'R$ {:.2f}',
+                    'Ad.Ferias': 'R$ {:.2f}',
+                    '13o': 'R$ {:.2f}',
+                    'INSS': 'R$ {:.2f}',
+                    'INSS 13o': 'R$ {:.2f}',
+                    'Sal.Liquido': 'R$ {:.2f}',
+                    'Aj.Custo': 'R$ {:.2f}',
+                    'Total': 'R$ {:.2f}',
+                }),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+            # Totais
+            st.divider()
+            tc1, tc2, tc3 = st.columns(3)
+            with tc1:
+                st.metric("Total Bruto (Proventos)", format_br_currency(
+                    summary['salario'].sum() + summary['ad_noturno_valor'].sum() +
+                    summary['dsr'].sum() + summary['ferias'].sum() +
+                    summary['adic_ferias'].sum() + summary['decimo'].sum()
+                ))
+            with tc2:
+                st.metric("Total Descontos (INSS+VT)", format_br_currency(
+                    summary['inss'].sum() + summary['inss_13'].sum() + summary['desc_vt'].sum()
+                ))
+            with tc3:
+                st.metric("Total Liquido a Pagar", format_br_currency(summary['total_pagar'].sum()))
+
+    with tab_download:
+        st.subheader("Download da Planilha")
+        st.markdown("""
+A planilha Excel sera gerada no formato padrao do DP com:
+- **Row 1**: Totais (SUBTOTAL)
+- **Row 2**: Parametros utilizados
+- **Row 3**: Headers
+- **Rows 4+**: Dados com todos os calculos
+
+Formatacao profissional com cores, bordas e colunas ajustadas.
+        """)
+
+        try:
+            excel_bytes = export_payroll_excel(df, params)
+            st.download_button(
+                label="Baixar Planilha de Folha (.xlsx)",
+                data=excel_bytes,
+                file_name=f"SF_SELECAO_ESTAPAR_RJ_{pd.Timestamp.now().strftime('%d.%m.%Y')}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                type="primary",
+                use_container_width=True,
+            )
+        except Exception as e:
+            st.error(f"Erro ao gerar planilha: {e}")
+
+
 st.set_page_config(
-    page_title="Verificacao Folha de Pagamento - SF Selecao",
+    page_title="SF Selecao - Gestao de Folha",
     page_icon="\U0001F4CA",
     layout="wide",
 )
+
+# Seletor de modulo
+modulo = st.sidebar.radio(
+    "Modulo",
+    ["Verificacao de Folha", "Preparo Contabilidade"],
+    index=0,
+)
+
+if modulo == "Preparo Contabilidade":
+    _render_preparo_contabilidade()
+    st.stop()
 
 st.title("Verificacao de Folha de Pagamento")
 st.markdown("**SF Servicos Selecao e Agenciamento LTDA** - Comparacao Folha de Ponto vs Folha de Pagamento")

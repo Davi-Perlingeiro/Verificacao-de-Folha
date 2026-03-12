@@ -4,12 +4,12 @@ Baseado na CLT e tabelas INSS 2025.
 """
 
 
-# Tabela INSS 2025 - aliquotas progressivas
+# Tabela INSS 2026 - aliquotas progressivas (Portaria MPS/MF No 13/2026)
 INSS_BRACKETS_2025 = [
-    (1518.00, 0.075),    # Ate R$ 1.518,00 -> 7,5%
-    (2793.88, 0.09),     # De R$ 1.518,01 ate R$ 2.793,88 -> 9%
-    (4190.83, 0.12),     # De R$ 2.793,89 ate R$ 4.190,83 -> 12%
-    (8157.41, 0.14),     # De R$ 4.190,84 ate R$ 8.157,41 -> 14%
+    (1621.00, 0.075),    # Ate R$ 1.621,00 -> 7,5%
+    (2902.84, 0.09),     # De R$ 1.621,01 ate R$ 2.902,84 -> 9%
+    (4354.27, 0.12),     # De R$ 2.902,85 ate R$ 4.354,27 -> 12%
+    (8475.55, 0.14),     # De R$ 4.354,28 ate R$ 8.475,55 -> 14%
 ]
 
 FGTS_RATE = 0.08  # 8%
