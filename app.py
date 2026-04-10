@@ -39,11 +39,23 @@ def _render_preparo_contabilidade():
     with st.sidebar:
         st.header("Parametros da Folha")
 
+        regiao = st.selectbox(
+            "Regiao",
+            ["BH", "RJ"],
+            index=0,
+            help="BH: Sal.Hora R$7,66 (base R$1.685,20) | RJ: Sal.Hora R$7,368 (base R$1.621,00)"
+        )
+
+        if regiao == "RJ":
+            default_sal_base = 1621.00
+        else:
+            default_sal_base = 1685.20
+
         sal_base = st.number_input(
             "Salario Base Mensal (R$)",
-            min_value=0.0, value=1621.00, step=1.0,
+            min_value=0.0, value=default_sal_base, step=1.0,
             format="%.2f",
-            help="Salario minimo vigente (2026: R$ 1.621,00)"
+            help="BH: R$ 1.685,20 | RJ: R$ 1.621,00"
         )
         divisor = st.number_input(
             "Divisor de Horas",
@@ -52,11 +64,12 @@ def _render_preparo_contabilidade():
         )
 
         sal_hora_calc = sal_base / divisor if divisor > 0 else 0
-        st.info(f"Salario Hora: **R$ {sal_hora_calc:.2f}**")
+        st.info(f"Salario Hora: **R$ {sal_hora_calc:.3f}**")
 
+        default_ajuda = 40.0 if regiao == "BH" else 30.0
         ajuda_custo = st.number_input(
             "Ajuda de Custo (R$)",
-            min_value=0.0, value=30.0, step=1.0,
+            min_value=0.0, value=default_ajuda, step=1.0,
             format="%.2f",
         )
         vt_desc = st.number_input(
@@ -73,6 +86,23 @@ def _render_preparo_contabilidade():
             help="Arquivo extraido do sistema interno",
             key='medicao_upload',
         )
+
+        st.divider()
+        if regiao == "BH":
+            st.header("Regras BH")
+            aplicar_regras_bh = st.checkbox(
+                "Aplicar regras de acrescimo BH",
+                value=False,
+                help=(
+                    "Acrescimos cumulativos na Ajuda de Custo:\n"
+                    "- Regra 1: Setores SCP Shop. Monte Carmo, Shopping Ponteio, Aeroporto Lagoa Santa (+R$30)\n"
+                    "- Regra 2: Saida a partir das 23:00h (+R$15)\n"
+                    "- Regra 3: Diaria 12h (18:00-06:00) (+R$15)\n"
+                    "- Regra 4: Diaria 12h (19:00-07:00) (+R$15)"
+                ),
+            )
+        else:
+            aplicar_regras_bh = False
 
     if not medicao_file:
         st.info("Faca upload do **Relatorio de Medicao** na barra lateral para iniciar o preparo da folha.")
@@ -114,7 +144,7 @@ def _render_preparo_contabilidade():
                 st.error("Nenhum turno encontrado no relatorio de medicao.")
                 return
 
-            df = build_payroll(turnos, params)
+            df = build_payroll(turnos, params, aplicar_regras_bh=aplicar_regras_bh)
             if df.empty:
                 st.error("Erro ao processar turnos.")
                 return

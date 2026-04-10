@@ -33,6 +33,97 @@ HORA_FICTA_FATOR = 8.0 / 7.0
 ADICIONAL_NOTURNO_PCT = 0.20
 
 
+# --- Regras de acrescimo de Ajuda de Custo (BH) ---
+# Valores sao CUMULATIVOS: cada regra atendida soma +R$15,00
+
+# Regra 1: Setores especificos
+SETORES_ACRESCIMO = {
+    'scp shop. monte carmo',
+    'shopping ponteio',
+    'aeroporto lagoa santa',
+}
+
+ACRESCIMO_LOCALIZACAO = 30.0
+ACRESCIMO_NOTURNO = 15.0
+
+# Regras especificas por funcionario (nome normalizado -> overrides)
+REGRAS_FUNCIONARIO = {
+    'jorge de sousa rocha': {
+        'ajuda_custo': 40.10,
+        'salario_hora': 8.41,
+    },
+}
+
+
+def _normalize(s: str) -> str:
+    """Remove acentos e normaliza para comparacao flexivel."""
+    import unicodedata
+    s = unicodedata.normalize('NFKD', s)
+    s = ''.join(c for c in s if not unicodedata.combining(c))
+    return s.lower().strip()
+
+
+def calcular_acrescimo_ajuda_custo(setor: str, horario_final, horario_inicial, horas_totais: float) -> float:
+    """
+    Calcula acrescimo cumulativo de ajuda de custo conforme regras BH.
+    Cada regra atendida soma +R$15,00 e sao cumulativas.
+
+    Regra 1: Setor em SCP Shop. Monte Carmo, Shopping Ponteio ou Aeroporto Lagoa Santa
+    Regra 2: Saida a partir das 23:00h (inclusive)
+    Regra 3: Diaria de 12h com entrada 18:00 e saida 06:00
+    Regra 4: Diaria de 12h com entrada 19:00 e saida 07:00
+
+    Returns:
+        Total de acrescimo (multiplo de R$15,00)
+    """
+    acrescimo = 0.0
+
+    # Regra 1: setor especifico (+R$30)
+    setor_norm = _normalize(setor) if setor else ''
+    for local in SETORES_ACRESCIMO:
+        if setor_norm == local or local in setor_norm or setor_norm in local:
+            acrescimo += ACRESCIMO_LOCALIZACAO
+            break
+
+    # Extrair hora/minuto dos horarios
+    hi_hour, hi_min = _extract_hm(horario_inicial)
+    hf_hour, hf_min = _extract_hm(horario_final)
+
+    # Regras 2, 3 e 4 sao mutuamente exclusivas: apenas +R$15 se qualquer uma se aplica
+    horas_int = round(horas_totais) if horas_totais else 0
+    regra_noturna = False
+
+    # Regra 3: 12h, entrada 18:00, saida 06:00
+    if horas_int == 12 and hi_hour == 18 and hi_min == 0 and hf_hour == 6 and hf_min == 0:
+        regra_noturna = True
+
+    # Regra 4: 12h, entrada 19:00, saida 07:00
+    if not regra_noturna and horas_int == 12 and hi_hour == 19 and hi_min == 0 and hf_hour == 7 and hf_min == 0:
+        regra_noturna = True
+
+    # Regra 2: saida a partir das 23:00h (inclusive) ou turno cruza meia-noite
+    if not regra_noturna and hf_hour is not None and hi_hour is not None:
+        cruza_meia_noite = hf_hour < hi_hour
+        if hf_hour >= 23 or cruza_meia_noite:
+            regra_noturna = True
+
+    if regra_noturna:
+        acrescimo += ACRESCIMO_NOTURNO
+
+    return acrescimo
+
+
+def _extract_hm(horario) -> tuple:
+    """Extrai (hora, minuto) de um datetime.time, datetime.datetime ou None."""
+    if horario is None:
+        return (None, None)
+    if isinstance(horario, datetime.time):
+        return (horario.hour, horario.minute)
+    if isinstance(horario, datetime.datetime):
+        return (horario.hour, horario.minute)
+    return (None, None)
+
+
 def calculate_inss_2026(base_calculo: float) -> float:
     """
     Calcula INSS com aliquotas progressivas (tabela 2026).
@@ -123,13 +214,14 @@ def calculate_night_hours_ficta(horario_inicial, horario_final, data_inicial=Non
     return round(night_ficta_hours, 4)
 
 
-def build_payroll(turnos: list, params: dict = None) -> pd.DataFrame:
+def build_payroll(turnos: list, params: dict = None, aplicar_regras_bh: bool = False) -> pd.DataFrame:
     """
     Transforma lista de turnos em DataFrame com todos os calculos de folha.
 
     Args:
         turnos: Lista de dicts do parser de medicao
         params: Parametros configuraveis (usa DEFAULT_PARAMS se None)
+        aplicar_regras_bh: Se True, aplica regras cumulativas de acrescimo BH na ajuda de custo
 
     Returns:
         DataFrame com uma linha por turno e todas as colunas calculadas
@@ -146,7 +238,7 @@ def build_payroll(turnos: list, params: dict = None) -> pd.DataFrame:
 
     rows = []
     for turno in turnos:
-        row = _calculate_turno(turno, salario_hora, params)
+        row = _calculate_turno(turno, salario_hora, params, aplicar_regras_bh)
         rows.append(row)
 
     if not rows:
@@ -178,12 +270,18 @@ def build_payroll(turnos: list, params: dict = None) -> pd.DataFrame:
     return df
 
 
-def _calculate_turno(turno: dict, salario_hora: float, params: dict) -> dict:
+def _calculate_turno(turno: dict, salario_hora: float, params: dict, aplicar_regras_bh: bool = False) -> dict:
     """Calcula todos os campos para um turno individual."""
     hi = turno.get('horario_inicial')
     hf = turno.get('horario_final')
     data = turno.get('data')
     data_final = turno.get('data_final', data)
+
+    # Verificar regras especificas por funcionario
+    nome_norm = _normalize(turno.get('nome', ''))
+    regra_func = REGRAS_FUNCIONARIO.get(nome_norm, {})
+    if 'salario_hora' in regra_func:
+        salario_hora = regra_func['salario_hora']
 
     # Horas trabalhadas
     horas_trabalhadas = _calc_horas_trabalhadas(hi, hf, data, data_final)
@@ -218,7 +316,19 @@ def _calculate_turno(turno: dict, salario_hora: float, params: dict) -> dict:
     inss_13 = 0.0
 
     sal_liquido = salario + gratif_funcao + ad_noturno_valor + dsr + ferias + adic_ferias + decimo - inss - inss_13 - desc_vt
-    ajuda_custo = params['ajuda_custo']
+    ajuda_custo = regra_func.get('ajuda_custo', params['ajuda_custo'])
+
+    # Aplicar acrescimos cumulativos de ajuda de custo (regras BH)
+    acrescimo_bh = 0.0
+    if aplicar_regras_bh:
+        acrescimo_bh = calcular_acrescimo_ajuda_custo(
+            setor=turno.get('setor', ''),
+            horario_final=hf,
+            horario_inicial=hi,
+            horas_totais=horas_trabalhadas,
+        )
+        ajuda_custo += acrescimo_bh
+
     total_pagar = sal_liquido + ajuda_custo
 
     return {
